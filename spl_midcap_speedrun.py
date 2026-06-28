@@ -46,6 +46,7 @@ import re
 import subprocess
 import sys
 import tempfile
+import threading
 import time
 import uuid
 import warnings
@@ -57,6 +58,15 @@ from urllib.parse import quote, urljoin
 
 os.environ.setdefault("PYTHONWARNINGS", "ignore::DeprecationWarning")
 warnings.filterwarnings("ignore", category=DeprecationWarning)
+LOG_LOCK = threading.Lock()
+
+
+def log_event(event) -> None:
+    with LOG_LOCK:
+        if isinstance(event, str):
+            print(event, flush=True)
+        else:
+            print(json.dumps(event, ensure_ascii=False, default=str), flush=True)
 
 PY_DEPS = {
     "httpx": "httpx",
@@ -76,7 +86,7 @@ def ensure_python_deps() -> None:
         except ImportError:
             missing.append(package)
     if missing:
-        print({"installing_python_packages": missing}, flush=True)
+        log_event({"installing_python_packages": missing})
         subprocess.check_call([sys.executable, "-m", "pip", "install", *missing])
 
 
@@ -274,7 +284,7 @@ def discover_month(cfg: Config, lo: date, hi: date) -> list[str]:
                     r.raise_for_status()
                 soup = BeautifulSoup(r.text, "html.parser")
             except Exception as exc:  # noqa: BLE001
-                print({"nitter_error": instance, "proxy": bool(proxy), "error": str(exc)}, flush=True)
+                log_event({"nitter_error": instance, "proxy": bool(proxy), "error": str(exc)})
                 break
 
             for item in soup.select(".timeline-item"):
@@ -636,9 +646,9 @@ def download_video(url: str, outdir: Path, proxy: str | None = None, job_id: str
             if total:
                 row["total_mb"] = round(total / 1024 / 1024, 1)
                 row["pct"] = round(downloaded / total * 100, 1)
-            print(row, flush=True)
+            log_event(row)
         elif state == "finished":
-            print({"job": label, "phase": "download_finished", "filename": Path(status.get("filename", "")).name}, flush=True)
+            log_event({"job": label, "phase": "download_finished", "filename": Path(status.get("filename", "")).name})
 
     opts = {
         "outtmpl": str(outdir / "%(id)s.%(ext)s"),
@@ -650,7 +660,7 @@ def download_video(url: str, outdir: Path, proxy: str | None = None, job_id: str
     }
     if proxy:
         opts["proxy"] = proxy
-    print({"job": job_id or stable_id(url), "phase": "download_start", "url": url, "proxy": bool(proxy)}, flush=True)
+    log_event({"job": job_id or stable_id(url), "phase": "download_start", "url": url, "proxy": bool(proxy)})
     with YoutubeDL(opts) as ydl:
         info = ydl.extract_info(url, download=True)
         path = Path(ydl.prepare_filename(info))
@@ -836,9 +846,9 @@ def process_video(cfg: Config, supa: Supabase, url: str) -> tuple[dict, list[dic
     frame_dir.mkdir(parents=True, exist_ok=True)
     started = utcnow()
     proxy = rotated_proxy(cfg, url)
-    print({"job": job_id, "phase": "start", "url": url}, flush=True)
+    log_event({"job": job_id, "phase": "start", "url": url})
     video_path = download_video(url, job_dir, proxy=proxy, job_id=job_id)
-    print({"job": job_id, "phase": "ocr_start", "video_file": video_path.name}, flush=True)
+    log_event({"job": job_id, "phase": "ocr_start", "video_file": video_path.name})
     records = []
     done = 0
     for ts, frame in iter_sampled_frames(video_path, cfg.frame_fps, cfg.max_frames):
@@ -848,10 +858,10 @@ def process_video(cfg: Config, supa: Supabase, url: str) -> tuple[dict, list[dic
             parsed["_ts"] = ts
             records.append(parsed)
         if done % 25 == 0:
-            print({"job": job_id, "frames": done, "candidate_reads": len(records)}, flush=True)
+            log_event({"job": job_id, "frames": done, "candidate_reads": len(records)})
 
     merged = merge_cards(records, cfg.min_card_frames)
-    print({"job": job_id, "phase": "merge", "frames": done, "candidate_reads": len(records), "cards": len(merged)}, flush=True)
+    log_event({"job": job_id, "phase": "merge", "frames": done, "candidate_reads": len(records), "cards": len(merged)})
     cards = []
     calls = []
     enriched = []
@@ -1002,7 +1012,7 @@ def main() -> None:
     cfg = parse_args()
     cfg.workdir.mkdir(parents=True, exist_ok=True)
     supa = Supabase(cfg)
-    print(
+    log_event(
         {
             "start": cfg.start.isoformat(),
             "end": cfg.end.isoformat(),
@@ -1012,11 +1022,10 @@ def main() -> None:
             "existing_video_jobs": cfg.existing_video_jobs,
             "urls_file": bool(cfg.urls_file),
             "skip_discovery": cfg.skip_discovery,
-        },
-        flush=True,
+        }
     )
     if cfg.clear_enriched:
-        print("[clear] enriched_calls", flush=True)
+        log_event({"clear": "enriched_calls"})
         supa.delete_collection("enriched_calls")
 
     urls = []
@@ -1025,49 +1034,46 @@ def main() -> None:
     if cfg.urls_file:
         file_urls = urls_from_file(cfg.urls_file)
         added = add_unique_urls(urls, seen, file_urls)
-        print({"urls_file": cfg.urls_file, "found": len(file_urls), "added": added, "total_urls": len(urls)}, flush=True)
+        log_event({"urls_file": cfg.urls_file, "found": len(file_urls), "added": added, "total_urls": len(urls)})
 
     if cfg.existing_video_jobs:
         existing_urls = urls_from_existing_video_jobs(supa)
         added = add_unique_urls(urls, seen, existing_urls)
-        print({"existing_video_jobs": True, "found": len(existing_urls), "added": added, "total_urls": len(urls)}, flush=True)
+        log_event({"existing_video_jobs": True, "found": len(existing_urls), "added": added, "total_urls": len(urls)})
 
     if not cfg.skip_discovery:
         windows = month_windows(cfg.start, cfg.end)
         for idx, (lo, hi) in enumerate(windows, 1):
             found = discover_month(cfg, lo, hi)
             added = add_unique_urls(urls, seen, found)
-            print(
+            log_event(
                 {
                     "discover": f"{idx}/{len(windows)}",
                     "month": f"{lo}..{hi}",
                     "found": len(found),
                     "added": added,
                     "total_urls": len(urls),
-                },
-                flush=True,
+                }
             )
 
     if not urls:
-        print(
+        log_event(
             {
                 "warning": "No videos queued. If Nitter is blocked from this RunPod IP, rerun with --existing-video-jobs --skip-discovery, --urls-file, or PROXY_LIST/PROXY_FILE.",
                 "done": True,
-            },
-            flush=True,
+            }
         )
         return
 
     all_jobs, all_calls, all_enriched = [], [], []
     from concurrent.futures import ThreadPoolExecutor, as_completed
 
-    print(
+    log_event(
         {
             "queue": len(urls),
             "workers": cfg.concurrency,
             "storage": "uploads call-card PNG frames only; source videos stay local and are deleted after OCR",
-        },
-        flush=True,
+        }
     )
     with ThreadPoolExecutor(max_workers=cfg.concurrency) as pool:
         futures = {pool.submit(process_video, cfg, supa, url): url for url in urls}
@@ -1078,20 +1084,20 @@ def main() -> None:
                 all_jobs.append(job)
                 all_calls.extend(calls)
                 all_enriched.extend(enriched)
-                print({"processed": f"{i}/{len(urls)}", "url": url, "cards": len(calls)}, flush=True)
+                log_event({"processed": f"{i}/{len(urls)}", "url": url, "cards": len(calls)})
                 supa.upsert_records("video_jobs", [job])
                 supa.upsert_records("stock_calls", calls)
                 supa.upsert_records("enriched_calls", enriched, id_key="call_id")
             except Exception as exc:  # noqa: BLE001
-                print({"failed": url, "error": str(exc)}, flush=True)
+                log_event({"failed": url, "error": str(exc)})
 
             if i % 10 == 0:
-                print({"checkpoint": f"{i}/{len(urls)}", "jobs_done": len(all_jobs), "calls": len(all_calls)}, flush=True)
+                log_event({"checkpoint": f"{i}/{len(urls)}", "jobs_done": len(all_jobs), "calls": len(all_calls)})
 
     supa.upsert_records("video_jobs", all_jobs)
     supa.upsert_records("stock_calls", all_calls)
     supa.upsert_records("enriched_calls", all_enriched, id_key="call_id")
-    print(
+    log_event(
         {
             "done": True,
             "videos": len(all_jobs),
@@ -1099,8 +1105,7 @@ def main() -> None:
             "enriched_calls": len(all_enriched),
             "rows_with_hindi_analyst": sum(1 for row in all_enriched if row.get("analyst")),
             "rows_with_source_x_link": sum(1 for row in all_enriched if row.get("source_url")),
-        },
-        flush=True,
+        }
     )
 
 

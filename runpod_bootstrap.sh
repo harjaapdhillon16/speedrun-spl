@@ -36,17 +36,37 @@ if command -v apt-get >/dev/null 2>&1; then
     tesseract-ocr \
     tesseract-ocr-hin \
     python3-pip \
+    python3-venv \
     ca-certificates
+  if apt-cache show python3.10 >/dev/null 2>&1; then
+    apt-get install -y --no-install-recommends python3.10 python3.10-venv
+    if apt-cache show python3.10-distutils >/dev/null 2>&1; then
+      apt-get install -y --no-install-recommends python3.10-distutils
+    fi
+  fi
 else
   echo "apt-get not found. Install ffmpeg, tesseract-ocr, tesseract-ocr-hin, and python3-pip manually." >&2
 fi
 
-python3 -m pip install --upgrade pip
+PYTHON_BIN="${RUNPOD_PYTHON:-}"
+if [[ -z "${PYTHON_BIN}" ]]; then
+  if command -v python3.10 >/dev/null 2>&1; then
+    PYTHON_BIN="python3.10"
+  else
+    PYTHON_BIN="python3"
+  fi
+fi
+
+VENV_DIR="${RUNPOD_VENV:-/workspace/spl_speedrun_venv}"
+"${PYTHON_BIN}" -m venv "${VENV_DIR}"
+source "${VENV_DIR}/bin/activate"
+
+python -m pip install --upgrade pip
 
 DEFAULT_CONCURRENCY="${RUNPOD_CONCURRENCY:-16}"
 DEFAULT_WORKDIR="${RUNPOD_WORKDIR:-/workspace/spl_speedrun_work}"
 
-python3 "${PYTHON_SCRIPT}" \
+python "${PYTHON_SCRIPT}" \
   --concurrency "${DEFAULT_CONCURRENCY}" \
   --workdir "${DEFAULT_WORKDIR}" \
   "$@"
