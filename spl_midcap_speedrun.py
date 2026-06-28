@@ -180,6 +180,8 @@ class Config:
     deep_step: float
     clear_enriched: bool
     cleanup_videos: bool
+    skip_processed: bool
+    cleanup_duplicates: bool
     existing_video_jobs: bool
     urls_file: str | None
     skip_discovery: bool
@@ -206,7 +208,7 @@ class Supabase:
     def table_url(self) -> str:
         return f"{self.base}/rest/v1/{self.cfg.table}"
 
-    def list_records(self, collection: str) -> list[dict]:
+    def list_record_rows(self, collection: str) -> list[dict]:
         rows: list[dict] = []
         page_size = 1000
         for start in range(0, 1000000, page_size):
@@ -217,17 +219,20 @@ class Supabase:
                 self.table_url(),
                 headers=h,
                 params={
-                    "select": "payload",
+                    "select": "id,payload,updated_at",
                     "collection": f"eq.{collection}",
-                    "order": "updated_at.asc",
+                    "order": "updated_at.desc",
                 },
             )
             r.raise_for_status()
             batch = r.json()
-            rows.extend(item.get("payload") or {} for item in batch)
+            rows.extend(batch)
             if len(batch) < page_size:
                 break
         return rows
+
+    def list_records(self, collection: str) -> list[dict]:
+        return [item.get("payload") or {} for item in self.list_record_rows(collection)]
 
     def delete_collection(self, collection: str) -> None:
         r = self.client.delete(
@@ -236,6 +241,20 @@ class Supabase:
             params={"collection": f"eq.{collection}"},
         )
         r.raise_for_status()
+
+    def delete_records(self, collection: str, ids: list[str]) -> None:
+        ids = [str(x) for x in ids if x]
+        if not ids:
+            return
+        for start in range(0, len(ids), 100):
+            chunk = ids[start : start + 100]
+            encoded = ",".join(chunk)
+            r = self.client.delete(
+                self.table_url(),
+                headers=self.headers(),
+                params={"collection": f"eq.{collection}", "id": f"in.({encoded})"},
+            )
+            r.raise_for_status()
 
     def upsert_records(self, collection: str, rows: list[dict], id_key: str = "id") -> None:
         if not rows:
@@ -364,6 +383,111 @@ def urls_from_existing_video_jobs(supa: Supabase) -> list[str]:
         if url:
             urls.append(url)
     return urls
+
+
+def row_completeness_score(row: dict) -> int:
+    score = 0
+    for key in (
+        "image_url",
+        "source_url",
+        "analyst",
+        "stock",
+        "stock_full_name",
+        "entry_date",
+        "entry_price",
+        "target_price",
+        "video_timestamp",
+    ):
+        value = row.get(key)
+        if value not in (None, "", [], {}):
+            score += 1
+    return score
+
+
+def enriched_duplicate_key(row: dict) -> tuple:
+    source_url = normalize_video_url(row.get("source_url"))
+    if source_url:
+        ts = row.get("video_timestamp")
+        try:
+            ts_key = round(float(ts), 1)
+        except (TypeError, ValueError):
+            ts_key = None
+        stock = re.sub(r"[^a-z0-9]", "", str(row.get("stock") or row.get("stock_full_name") or "").lower())
+        return (
+            "source",
+            source_url,
+            ts_key,
+            stock,
+            row.get("entry_date"),
+            row.get("target_price"),
+            row.get("reco"),
+        )
+    return ("call", row.get("call_id") or stable_id(json.dumps(row, sort_keys=True, default=str)))
+
+
+def processed_source_urls(enriched_rows: list[dict]) -> set[str]:
+    urls = set()
+    for row in enriched_rows:
+        url = normalize_video_url(row.get("source_url"))
+        if url:
+            urls.add(url)
+    return urls
+
+
+def cleanup_duplicate_enriched_calls(supa: Supabase) -> tuple[list[dict], int]:
+    rows = supa.list_record_rows("enriched_calls")
+    keep_by_key: dict[tuple, dict] = {}
+    delete_ids: list[str] = []
+    for item in rows:
+        payload = item.get("payload") or {}
+        key = enriched_duplicate_key(payload)
+        current = keep_by_key.get(key)
+        if current is None:
+            keep_by_key[key] = item
+            continue
+        current_score = row_completeness_score(current.get("payload") or {})
+        incoming_score = row_completeness_score(payload)
+        if incoming_score > current_score:
+            delete_ids.append(str(current.get("id")))
+            keep_by_key[key] = item
+        else:
+            delete_ids.append(str(item.get("id")))
+    supa.delete_records("enriched_calls", delete_ids)
+    kept = [item.get("payload") or {} for item in keep_by_key.values()]
+    return kept, len(delete_ids)
+
+
+def cleanup_duplicate_video_jobs(supa: Supabase) -> tuple[list[str], int]:
+    rows = supa.list_record_rows("video_jobs")
+    keep_by_url: dict[str, dict] = {}
+    delete_ids: list[str] = []
+
+    def score(payload: dict) -> tuple:
+        status_rank = {"done": 4, "extracting": 3, "ocr": 3, "downloading": 2, "queued": 1, "failed": 0}
+        return (
+            status_rank.get(str(payload.get("status") or ""), 0),
+            int(payload.get("calls_added") or 0),
+            int(payload.get("cards_found") or 0),
+            row_completeness_score(payload),
+        )
+
+    for item in rows:
+        payload = item.get("payload") or {}
+        url = normalize_video_url(payload.get("url"))
+        if not url:
+            continue
+        current = keep_by_url.get(url)
+        if current is None:
+            keep_by_url[url] = item
+            continue
+        if score(payload) > score(current.get("payload") or {}):
+            delete_ids.append(str(current.get("id")))
+            keep_by_url[url] = item
+        else:
+            delete_ids.append(str(item.get("id")))
+    supa.delete_records("video_jobs", delete_ids)
+    urls = list(keep_by_url.keys())
+    return urls, len(delete_ids)
 
 
 # OCR geometry copied into this standalone file.
@@ -1058,7 +1182,10 @@ def parse_args() -> Config:
     p.add_argument("--existing-video-jobs", action="store_true", help="Process ZeeBusiness URLs already stored in Supabase video_jobs")
     p.add_argument("--urls-file", default=os.getenv("URLS_FILE", ""), help="File containing one ZeeBusiness X/Twitter/Nitter status URL per line")
     p.add_argument("--skip-discovery", action="store_true", help="Do not call Nitter; use --existing-video-jobs and/or --urls-file only")
-    p.add_argument("--no-clear-enriched", action="store_true")
+    p.add_argument("--skip-processed", action=argparse.BooleanOptionalAction, default=True, help="Skip videos that already have enriched_calls rows")
+    p.add_argument("--cleanup-duplicates", action=argparse.BooleanOptionalAction, default=True, help="Delete duplicate enriched_calls/video_jobs rows before queueing")
+    p.add_argument("--clear-enriched", action="store_true", help="Delete all enriched_calls before processing. Off by default for resumable runs.")
+    p.add_argument("--no-clear-enriched", action="store_true", help="Compatibility no-op; enriched_calls are preserved unless --clear-enriched is passed")
     p.add_argument("--keep-source-videos", action="store_true")
     args = p.parse_args()
     supabase_url = os.getenv("SUPABASE_URL") or os.getenv("url")
@@ -1093,8 +1220,10 @@ def parse_args() -> Config:
         soft_max_frames=args.soft_max_frames,
         deep_window=args.deep_window,
         deep_step=args.deep_step,
-        clear_enriched=not args.no_clear_enriched,
+        clear_enriched=args.clear_enriched and not args.no_clear_enriched,
         cleanup_videos=not args.keep_source_videos,
+        skip_processed=args.skip_processed,
+        cleanup_duplicates=args.cleanup_duplicates,
         existing_video_jobs=args.existing_video_jobs,
         urls_file=args.urls_file or None,
         skip_discovery=args.skip_discovery,
@@ -1121,11 +1250,34 @@ def main() -> None:
             "soft_max_frames": cfg.soft_max_frames,
             "deep_window": cfg.deep_window,
             "deep_step": cfg.deep_step,
+            "skip_processed": cfg.skip_processed,
+            "cleanup_duplicates": cfg.cleanup_duplicates,
+            "clear_enriched": cfg.clear_enriched,
         }
     )
+
+    enriched_rows: list[dict] = []
+    existing_video_job_urls: list[str] | None = None
     if cfg.clear_enriched:
         log_event({"clear": "enriched_calls"})
         supa.delete_collection("enriched_calls")
+    elif cfg.cleanup_duplicates:
+        enriched_rows, removed_enriched = cleanup_duplicate_enriched_calls(supa)
+        existing_video_job_urls, removed_video_jobs = cleanup_duplicate_video_jobs(supa)
+        log_event(
+            {
+                "app_records_loaded": True,
+                "enriched_calls": len(enriched_rows),
+                "duplicate_enriched_calls_deleted": removed_enriched,
+                "video_jobs": len(existing_video_job_urls),
+                "duplicate_video_jobs_deleted": removed_video_jobs,
+            }
+        )
+    elif cfg.skip_processed:
+        enriched_rows = supa.list_records("enriched_calls")
+        log_event({"app_records_loaded": True, "enriched_calls": len(enriched_rows)})
+
+    processed_urls = processed_source_urls(enriched_rows) if cfg.skip_processed and not cfg.clear_enriched else set()
 
     urls = []
     seen = set()
@@ -1136,7 +1288,7 @@ def main() -> None:
         log_event({"urls_file": cfg.urls_file, "found": len(file_urls), "added": added, "total_urls": len(urls)})
 
     if cfg.existing_video_jobs:
-        existing_urls = urls_from_existing_video_jobs(supa)
+        existing_urls = existing_video_job_urls if existing_video_job_urls is not None else urls_from_existing_video_jobs(supa)
         added = add_unique_urls(urls, seen, existing_urls)
         log_event({"existing_video_jobs": True, "found": len(existing_urls), "added": added, "total_urls": len(urls)})
 
@@ -1154,6 +1306,19 @@ def main() -> None:
                     "total_urls": len(urls),
                 }
             )
+
+    if processed_urls:
+        before = len(urls)
+        urls = [url for url in urls if url not in processed_urls]
+        seen = set(urls)
+        log_event(
+            {
+                "skip_processed": True,
+                "already_enriched_urls": len(processed_urls),
+                "skipped_urls": before - len(urls),
+                "remaining_urls": len(urls),
+            }
+        )
 
     if not urls:
         log_event(
