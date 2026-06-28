@@ -1,0 +1,10 @@
+.env
+*.env
+__pycache__/
+*.pyc
+spl_speedrun_work/
+video_cache/
+video_frames/
+*.mp4
+*.png
+*.log
