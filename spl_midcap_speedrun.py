@@ -24,7 +24,8 @@ What this script does:
   - stores analyst name in Hindi on the individual stock call row
   - uploads call-card PNGs to Supabase Storage; it does not upload source videos
   - writes video_jobs, stock_calls, and enriched_calls into app_records
-  - clears enriched_calls before rebuilding unless --no-clear-enriched is used
+  - preserves enriched_calls by default, skips already processed videos, and
+    only clears enriched_calls when --clear-enriched is explicitly used
 
 Notes:
   - Nitter instances are flaky. Pass --nitter "https://instance1,https://instance2"
