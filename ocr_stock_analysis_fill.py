@@ -430,6 +430,13 @@ def main() -> None:
         jobs = jobs[: args.limit]
     log_event({"jobs_with_frames": len(jobs), "workers": args.workers, "known_jobs": len(meta)})
 
+    # Warm the EasyOCR model cache ONCE, sequentially, before spawning workers.
+    # Otherwise every worker races to download the same weights into the shared
+    # cache dir and corrupts them ("MD5 hash mismatch").
+    log_event({"warming_easyocr_model": True})
+    _get_reader()
+    log_event({"easyocr_model_ready": True})
+
     total, done, errors, dupes = 0, 0, 0, 0
     seen: set = set()
     pending: list[dict] = []
