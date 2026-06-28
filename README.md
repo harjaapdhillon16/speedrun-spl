@@ -1,5 +1,40 @@
 # RunPod SPL Midcap Speedrun
 
+## Accurate re-OCR → `stock_analysis_calls` (EasyOCR, recommended)
+
+The original Tesseract whole-frame parser was inaccurate (wrong company on most
+cards, targets polluted with duration/quote numbers, garbled Hindi analyst
+names). `ocr_stock_analysis_fill.py` re-reads the card frames **already in
+Supabase Storage** with EasyOCR (Devanagari + English) + a layout-aware parser,
+market-enriches via the same `enrich_card`, and fills the dedicated
+`stock_analysis_calls` table. No video download / ffmpeg needed — it's pure
+image→text, so it's fast and fully parallel across CPUs.
+
+Prereq: create the table once in the Supabase SQL editor using
+`stock_analysis_calls_schema.sql` (repo root).
+
+```bash
+export url='https://YOUR_PROJECT.supabase.co'
+export secret_key='YOUR_SUPABASE_SERVICE_ROLE_KEY'
+
+bash run_ocr_fill.sh                # background, uses all CPUs
+# bash run_ocr_fill.sh --workers 24 # or pin the worker count
+tail -f ./ocr_fill.log
+# stop: kill "$(cat ./ocr_fill.pid)"
+```
+
+The first launch pip-installs `easyocr`+`torch` (large) and downloads the model
+weights, so it takes a few minutes before rows start appearing. The run is
+idempotent (row id keyed on source_url+stock+entry_date), so re-running fills
+gaps and corrects rows in place. Progress prints as JSON lines
+(`{"progress": "...", "rows": N}`), ending with `{"DONE": true, ...}`.
+
+To process just a few jobs as a test: `python ocr_stock_analysis_fill.py --workers 4 --limit 20`.
+
+---
+
+## Original video pipeline
+
 Use **Pods** in RunPod.
 
 Do not use Serverless, Public endpoints, or Clusters for this job. This is a one-off batch job that downloads videos, runs ffmpeg/OpenCV/Tesseract OCR, uploads frames, and writes rows to Supabase.
