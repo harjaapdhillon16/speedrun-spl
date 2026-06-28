@@ -31,9 +31,9 @@ import re
 import ssl
 import subprocess
 import sys
+import threading
 import uuid
-from concurrent.futures import ProcessPoolExecutor, as_completed
-from multiprocessing import cpu_count, get_context
+from concurrent.futures import ThreadPoolExecutor, as_completed
 
 # macOS / minimal Linux Python may lack CA certs for the one-time EasyOCR
 # model-weight download.
@@ -96,16 +96,20 @@ def _storage_get(path: str) -> bytes:
 _DEVA = str.maketrans("०१२३४५६७८९", "0123456789")
 _NUM = re.compile(r"\d[\d,]*(?:\.\d+)?")
 _PANEL_X = 0.56
-_reader = None
+# One EasyOCR Reader per thread (each owns its own torch model — avoids any
+# shared-state thread-safety question; the weights are read from the cache the
+# main thread warmed, so no per-thread download).
+_tls = threading.local()
 
 
 def _get_reader():
-    global _reader
-    if _reader is None:
+    r = getattr(_tls, "reader", None)
+    if r is None:
         import easyocr
 
-        _reader = easyocr.Reader(["hi", "en"], gpu=False, verbose=False)
-    return _reader
+        r = easyocr.Reader(["hi", "en"], gpu=False, verbose=False)
+        _tls.reader = r
+    return r
 
 
 class _Box:
@@ -248,11 +252,6 @@ def extract(img) -> dict:
 # Worker: list a job's frames, download, OCR
 # --------------------------------------------------------------------------- #
 _META: dict = {}
-
-
-def _winit(meta: dict) -> None:
-    global _META
-    _META = meta
 
 
 def _process_job(job_id: str) -> list[dict]:
@@ -419,20 +418,35 @@ def _upsert(rows: list[dict]) -> None:
 def main() -> None:
     if not SUPABASE_URL or not SERVICE_KEY:
         raise SystemExit("Set SUPABASE_URL/url and SUPABASE_SERVICE_ROLE_KEY/secret_key first.")
+    global _META
     p = argparse.ArgumentParser()
-    p.add_argument("--workers", type=int, default=max(2, cpu_count() - 2))
+    p.add_argument("--workers", type=int, default=min(12, (os.cpu_count() or 8)))
     p.add_argument("--limit", type=int, default=None, help="process only the first N job dirs (testing)")
     args = p.parse_args()
 
-    meta = _build_meta()
+    # Each thread runs EasyOCR with 1 torch thread so the pool — not torch's
+    # intra-op threads — provides the parallelism. cv2 threads off too.
+    try:
+        import torch
+
+        torch.set_num_threads(1)
+    except Exception:  # noqa: BLE001
+        pass
+    try:
+        import cv2
+
+        cv2.setNumThreads(0)
+    except Exception:  # noqa: BLE001
+        pass
+
+    _META = _build_meta()
     jobs = _storage_list("video_frames/")
     if args.limit:
         jobs = jobs[: args.limit]
-    log_event({"jobs_with_frames": len(jobs), "workers": args.workers, "known_jobs": len(meta)})
+    log_event({"jobs_with_frames": len(jobs), "workers": args.workers, "known_jobs": len(_META)})
 
-    # Warm the EasyOCR model cache ONCE, sequentially, before spawning workers.
-    # Otherwise every worker races to download the same weights into the shared
-    # cache dir and corrupts them ("MD5 hash mismatch").
+    # Warm the EasyOCR model cache ONCE in the main thread before the pool, so
+    # worker threads read the weights from cache instead of racing to download.
     log_event({"warming_easyocr_model": True})
     _get_reader()
     log_event({"easyocr_model_ready": True})
@@ -440,8 +454,7 @@ def main() -> None:
     total, done, errors, dupes = 0, 0, 0, 0
     seen: set = set()
     pending: list[dict] = []
-    ctx = get_context("spawn")
-    with ProcessPoolExecutor(max_workers=args.workers, mp_context=ctx, initializer=_winit, initargs=(meta,)) as pool:
+    with ThreadPoolExecutor(max_workers=args.workers) as pool:
         futs = {pool.submit(_process_job, j): j for j in jobs}
         for fut in as_completed(futs):
             done += 1
