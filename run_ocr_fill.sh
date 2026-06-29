@@ -42,7 +42,7 @@ fi
 source "${VENV_DIR}/bin/activate"
 python -m pip install --upgrade pip >/dev/null
 
-WORKERS="${OCR_WORKERS:-${RUNPOD_CONCURRENCY:-$(nproc 2>/dev/null || echo 8)}}"
+WORKERS="${OCR_WORKERS:-8}"
 LOG_FILE="${OCR_LOG_FILE:-./ocr_fill.log}"
 PID_FILE="${OCR_PID_FILE:-./ocr_fill.pid}"
 
