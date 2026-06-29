@@ -59,7 +59,12 @@ import httpx  # noqa: E402
 
 # Reuse the runner's market-join + Supabase REST helpers (importing it also
 # installs its own deps and defines enrich_card/yahoo_*).
-from spl_midcap_speedrun import enrich_card, log_event  # noqa: E402
+from spl_midcap_speedrun import enrich_card, log_event, pct  # noqa: E402
+
+# Market enrichment (Yahoo Finance) is OFF by default: RunPod/datacenter IPs are
+# routinely blocked by Yahoo, which makes every worker hang on network timeouts.
+# OCR-only fill is fast and Supabase-only; enable --enrich where Yahoo is reachable.
+ENRICH = False
 
 SUPABASE_URL = (os.getenv("SUPABASE_URL") or os.getenv("url") or "").rstrip("/")
 SERVICE_KEY = os.getenv("SUPABASE_SERVICE_ROLE_KEY") or os.getenv("SUPABASE_SECRET_KEY") or os.getenv("secret_key")
@@ -340,66 +345,98 @@ def _build_meta() -> dict:
 
 
 def _to_row(rec: dict):
+    from datetime import date as _date, timedelta as _td
+
     ocr = rec["ocr"]
     a = (ocr.get("action") or "").lower()
-    action = "SELL" if a == "sell" else "BUY"
+    is_buy = a != "sell"
+    reco = "Sell" if a == "sell" else "Buy"
     dur = ocr.get("duration_months")
     horizon = dur[1] if dur else None
     entry_date = rec.get("snowflake") or ocr.get("date")
-    card_in = {
+    targets = ocr.get("targets") or []
+    target_price = float(targets[0]) if targets else None
+    entry = ocr.get("entry")
+    expected = pct(entry, target_price, is_buy) if (entry and target_price) else None
+
+    # Base row from OCR only — no external network. Symbol is the raw OCR name
+    # (NSE-symbol resolution + mark-to-market happen in --enrich mode).
+    target_date = None
+    try:
+        if entry_date and horizon:
+            target_date = (_date.fromisoformat(entry_date) + _td(days=horizon * 30)).isoformat()
+    except ValueError:
+        pass
+
+    stock = ocr.get("stock")
+    row = {
         "call_id": rec["call_id"],
-        "stock": ocr.get("stock"),
-        "action": action,
-        "entry": ocr.get("entry"),
-        "stop_loss": ocr.get("stop_loss"),
-        "targets": ocr.get("targets") or [],
-        "entry_date": entry_date,
-        "horizon_months": horizon,
-        "current_price": ocr.get("entry"),
-    }
-    e = enrich_card(card_in, rec["image_url"], rec.get("source_url"), rec.get("video_timestamp") or 0.0)
-
-    open_close, close_date = None, None
-    status = e.get("status")
-    if status == "open":
-        open_close = "Open"
-    elif status and status.startswith("closed on"):
-        open_close = "Close"
-        m = re.search(r"(\d{2})/(\d{2})/(\d{4})", status)
-        if m:
-            close_date = f"{m.group(3)}-{m.group(2)}-{m.group(1)}"
-
-    nat = f"{e.get('source_url') or ''}|{e.get('stock') or ''}|{e.get('entry_date') or '1900-01-01'}"
-    return {
-        "id": str(uuid.uuid5(uuid.NAMESPACE_URL, nat)),
-        "call_id": e.get("call_id"),
         "video_job_id": rec["job_id"],
-        "source_url": e.get("source_url"),
-        "image_url": e.get("image_url"),
-        "video_timestamp": e.get("video_timestamp"),
+        "source_url": rec.get("source_url"),
+        "image_url": rec["image_url"],
+        "video_timestamp": rec.get("video_timestamp"),
         "raw_ocr_text": json.dumps(ocr, ensure_ascii=False),
-        "analyst": e.get("analyst"),
-        "stock": e.get("stock"),
-        "stock_full_name": e.get("stock_full_name"),
-        "analyst_company": e.get("analyst_company"),
-        "entry_date": e.get("entry_date"),
-        "target_date": e.get("target_date"),
-        "close_date": close_date,
-        "entry_price": e.get("entry_price"),
-        "stop_loss": e.get("stop_loss"),
-        "target_price": e.get("target_price"),
-        "expected_return_pct": e.get("expected_return_pct"),
-        "reco": e.get("reco"),
-        "open_close": open_close,
-        "current_price": e.get("current_price"),
-        "actual_return_pct": e.get("actual_return_pct"),
-        "annualized_pct": e.get("annualized_pct"),
-        "success": e.get("success"),
-        "source": e.get("source") or "video",
-        "platform": e.get("platform") or "Zee Business",
-        "program": e.get("program") or "SPL Midcap",
+        "analyst": ocr.get("analyst"),
+        "stock": stock,
+        "stock_full_name": None,
+        "analyst_company": None,
+        "entry_date": entry_date,
+        "target_date": target_date,
+        "close_date": None,
+        "entry_price": round(entry, 2) if entry else None,
+        "stop_loss": ocr.get("stop_loss"),
+        "target_price": target_price,
+        "expected_return_pct": expected,
+        "reco": reco,
+        "open_close": None,
+        "current_price": None,
+        "actual_return_pct": None,
+        "annualized_pct": None,
+        "success": None,
+        "source": "video",
+        "platform": "Zee Business",
+        "program": "SPL Midcap",
         "theme": ocr.get("theme"),
     }
+
+    if ENRICH:
+        # Resolve NSE symbol + mark-to-market via Yahoo (only where reachable).
+        card_in = {
+            "call_id": rec["call_id"], "stock": stock,
+            "action": "SELL" if not is_buy else "BUY",
+            "entry": entry, "stop_loss": ocr.get("stop_loss"), "targets": targets,
+            "entry_date": entry_date, "horizon_months": horizon, "current_price": entry,
+        }
+        try:
+            e = enrich_card(card_in, rec["image_url"], rec.get("source_url"), rec.get("video_timestamp") or 0.0)
+            status = e.get("status")
+            open_close = "Open" if status == "open" else ("Close" if (status or "").startswith("closed on") else None)
+            close_date = None
+            if open_close == "Close":
+                m = re.search(r"(\d{2})/(\d{2})/(\d{4})", status)
+                if m:
+                    close_date = f"{m.group(3)}-{m.group(2)}-{m.group(1)}"
+            row.update({
+                "stock": e.get("stock") or stock,
+                "stock_full_name": e.get("stock_full_name"),
+                "entry_date": e.get("entry_date") or entry_date,
+                "target_date": e.get("target_date") or target_date,
+                "close_date": close_date,
+                "entry_price": e.get("entry_price") if e.get("entry_price") is not None else row["entry_price"],
+                "target_price": e.get("target_price") if e.get("target_price") is not None else target_price,
+                "expected_return_pct": e.get("expected_return_pct") if e.get("expected_return_pct") is not None else expected,
+                "open_close": open_close,
+                "current_price": e.get("current_price"),
+                "actual_return_pct": e.get("actual_return_pct"),
+                "annualized_pct": e.get("annualized_pct"),
+                "success": e.get("success"),
+            })
+        except Exception:  # noqa: BLE001 - Yahoo unreachable/blocked; keep OCR-only row
+            pass
+
+    nat = f"{row.get('source_url') or ''}|{row.get('stock') or ''}|{row.get('entry_date') or '1900-01-01'}"
+    row["id"] = str(uuid.uuid5(uuid.NAMESPACE_URL, nat))
+    return row
 
 
 def _upsert(rows: list[dict]) -> None:
@@ -418,11 +455,13 @@ def _upsert(rows: list[dict]) -> None:
 def main() -> None:
     if not SUPABASE_URL or not SERVICE_KEY:
         raise SystemExit("Set SUPABASE_URL/url and SUPABASE_SERVICE_ROLE_KEY/secret_key first.")
-    global _META
+    global _META, ENRICH
     p = argparse.ArgumentParser()
     p.add_argument("--workers", type=int, default=min(12, (os.cpu_count() or 8)))
     p.add_argument("--limit", type=int, default=None, help="process only the first N job dirs (testing)")
+    p.add_argument("--enrich", action="store_true", help="also resolve NSE symbol + mark-to-market via Yahoo (slow/blocked on many datacenter IPs)")
     args = p.parse_args()
+    ENRICH = args.enrich
 
     # Each thread runs EasyOCR with 1 torch thread so the pool — not torch's
     # intra-op threads — provides the parallelism. cv2 threads off too.
@@ -443,7 +482,7 @@ def main() -> None:
     jobs = _storage_list("video_frames/")
     if args.limit:
         jobs = jobs[: args.limit]
-    log_event({"jobs_with_frames": len(jobs), "workers": args.workers, "known_jobs": len(_META)})
+    log_event({"jobs_with_frames": len(jobs), "workers": args.workers, "known_jobs": len(_META), "enrich": ENRICH})
 
     # Warm the EasyOCR model cache ONCE in the main thread before the pool, so
     # worker threads read the weights from cache instead of racing to download.
@@ -474,11 +513,11 @@ def main() -> None:
                     continue
                 seen.add(key)
                 pending.append(row)
-            if len(pending) >= 100:
+            if len(pending) >= 25:
                 _upsert(pending)
                 total += len(pending)
                 pending = []
-            if done % 25 == 0:
+            if done % 10 == 0:
                 log_event({"progress": f"{done}/{len(jobs)}", "rows": total, "dupes": dupes, "errors": errors})
     if pending:
         _upsert(pending)
