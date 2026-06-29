@@ -33,7 +33,6 @@ import subprocess
 import sys
 import threading
 import uuid
-from concurrent.futures import ThreadPoolExecutor, as_completed
 
 # macOS / minimal Linux Python may lack CA certs for the one-time EasyOCR
 # model-weight download.
@@ -104,29 +103,28 @@ _PANEL_X = 0.56
 # ONE shared EasyOCR Reader, built once in the main thread and reused by every
 # worker thread. Building a torch model concurrently in many threads deadlocks;
 # inference (readtext) on a shared eval model is fine across threads.
-_READER = None
-_READER_LOCK = threading.Lock()
-# EasyOCR/torch deadlocks under many concurrent readtext calls (fine at 4
-# threads, hangs at 16). Serialize inference; frame downloads still overlap
-# across the worker threads, so the network I/O is what parallelizes.
-_OCR_LOCK = threading.Lock()
+# Each worker thread gets its OWN EasyOCR reader (a model used from the same
+# thread that built it — verified to work). A shared reader built in the main
+# thread and used from workers hangs; building many models concurrently also
+# deadlocks torch — so construction is serialized with a lock, while inference
+# runs concurrently (each thread on its own model).
+_tls = threading.local()
+_BUILD_LOCK = threading.Lock()
 
 
 def _get_reader():
-    global _READER
-    if _READER is None:
-        with _READER_LOCK:
-            if _READER is None:
-                import easyocr
+    r = getattr(_tls, "reader", None)
+    if r is None:
+        import easyocr
 
-                _READER = easyocr.Reader(["hi", "en"], gpu=False, verbose=False)
-    return _READER
+        with _BUILD_LOCK:  # serialize model construction (concurrent build deadlocks)
+            r = easyocr.Reader(["hi", "en"], gpu=False, verbose=False)
+        _tls.reader = r
+    return r
 
 
 def _readtext(img):
-    reader = _get_reader()
-    with _OCR_LOCK:
-        return reader.readtext(img)
+    return _get_reader().readtext(img)
 
 
 class _Box:
@@ -469,7 +467,7 @@ def main() -> None:
         raise SystemExit("Set SUPABASE_URL/url and SUPABASE_SERVICE_ROLE_KEY/secret_key first.")
     global _META, ENRICH
     p = argparse.ArgumentParser()
-    p.add_argument("--workers", type=int, default=min(12, (os.cpu_count() or 8)))
+    p.add_argument("--workers", type=int, default=1, help="ignored — run is now strictly sequential (1 image at a time)")
     p.add_argument("--limit", type=int, default=None, help="process only the first N job dirs (testing)")
     p.add_argument("--enrich", action="store_true", help="also resolve NSE symbol + mark-to-market via Yahoo (slow/blocked on many datacenter IPs)")
     args = p.parse_args()
@@ -494,7 +492,7 @@ def main() -> None:
     jobs = _storage_list("video_frames/")
     if args.limit:
         jobs = jobs[: args.limit]
-    log_event({"jobs_with_frames": len(jobs), "workers": args.workers, "known_jobs": len(_META), "enrich": ENRICH})
+    log_event({"jobs_with_frames": len(jobs), "mode": "sequential", "known_jobs": len(_META), "enrich": ENRICH})
 
     # Warm the EasyOCR model cache ONCE in the main thread before the pool, so
     # worker threads read the weights from cache instead of racing to download.
@@ -502,38 +500,37 @@ def main() -> None:
     _get_reader()
     log_event({"easyocr_model_ready": True})
 
+    # Strictly sequential: one job at a time, one image at a time. The threaded
+    # pool deadlocked torch/EasyOCR (pool_submitted logged, zero job_done) — a
+    # single-threaded stream is slower but actually finishes the whole batch.
     total, done, errors, dupes = 0, 0, 0, 0
     seen: set = set()
     pending: list[dict] = []
-    with ThreadPoolExecutor(max_workers=args.workers) as pool:
-        futs = {pool.submit(_process_job, j): j for j in jobs}
-        log_event({"pool_submitted": len(futs)})
-        for fut in as_completed(futs):
-            done += 1
-            if done <= 3 or done % 10 == 0:
-                log_event({"job_done": done, "rows": total, "pending": len(pending)})
-            try:
-                recs = fut.result()
-            except Exception as exc:  # noqa: BLE001
-                log_event({"job_failed": futs[fut], "error": str(exc)})
+    log_event({"sequential": True, "jobs": len(jobs)})
+    for j in jobs:
+        done += 1
+        try:
+            recs = _process_job(j)
+        except Exception as exc:  # noqa: BLE001
+            log_event({"job_failed": j, "error": str(exc)})
+            continue
+        for item in recs:
+            if "error" in item:
+                errors += 1
                 continue
-            for item in recs:
-                if "error" in item:
-                    errors += 1
-                    continue
-                row = item["row"]
-                key = (row.get("source_url") or "", row.get("stock") or "", row.get("entry_date") or "1900-01-01")
-                if key in seen:
-                    dupes += 1
-                    continue
-                seen.add(key)
-                pending.append(row)
-            if len(pending) >= 25:
-                _upsert(pending)
-                total += len(pending)
-                pending = []
-            if done % 10 == 0:
-                log_event({"progress": f"{done}/{len(jobs)}", "rows": total, "dupes": dupes, "errors": errors})
+            row = item["row"]
+            key = (row.get("source_url") or "", row.get("stock") or "", row.get("entry_date") or "1900-01-01")
+            if key in seen:
+                dupes += 1
+                continue
+            seen.add(key)
+            pending.append(row)
+        if len(pending) >= 25:
+            _upsert(pending)
+            total += len(pending)
+            pending = []
+        if done <= 3 or done % 10 == 0:
+            log_event({"progress": f"{done}/{len(jobs)}", "rows": total, "dupes": dupes, "errors": errors})
     if pending:
         _upsert(pending)
         total += len(pending)

@@ -1,14 +1,53 @@
 # RunPod SPL Midcap Speedrun
 
-## Accurate re-OCR → `stock_analysis_calls` (EasyOCR, recommended)
+## GPU vision-model re-fill → `stock_analysis_calls` (Qwen2.5-VL, recommended)
+
+`ocr_vlm_fill.py` is the fast, accurate path. On a RunPod **GPU** pod it reads
+the card frames **already in Supabase Storage** and feeds each to a
+vision-language model (Qwen2.5-VL) that returns the call fields directly as JSON
+— it *understands* the card (Hindi analyst names, खरीदें/बेचें, the price/target
+columns), so it is far more accurate than the EasyOCR layout heuristics that
+returned the wrong company on most cards. One model load, then it rips:
+GPU-batched **3 images per forward pass** (override with `--batch`), with the
+next batch's downloads overlapping the GPU. No per-thread torch rebuild (that is
+what deadlocked the CPU EasyOCR run).
+
+Prereq: create the table once with `stock_analysis_calls_schema.sql` (repo root).
+Use a CUDA / PyTorch RunPod base image so torch is already installed.
+
+```bash
+export url='https://YOUR_PROJECT.supabase.co'
+export secret_key='YOUR_SUPABASE_SERVICE_ROLE_KEY'
+
+bash run_vlm_fill.sh                 # background, batch=3, 7B model
+# bash run_vlm_fill.sh --batch 4
+# VLM_MODEL='Qwen/Qwen2.5-VL-3B-Instruct' bash run_vlm_fill.sh   # smaller GPU
+tail -f ./vlm_fill.log
+# stop: kill "$(cat ./vlm_fill.pid)"
+```
+
+First launch pip-installs `transformers`/`accelerate` and downloads the model
+weights (~16GB for 7B) once; then inference is fast. Idempotent (row id keyed on
+source_url+stock+entry_date), so re-running corrects rows in place. Progress
+prints as JSON lines (`{"frames": N, "rows": N}`), ending with `{"DONE": true}`.
+Smoke test on a few jobs: `python ocr_vlm_fill.py --limit 5 --batch 3`.
+
+Add `--enrich` to also resolve the NSE symbol + mark-to-market via Yahoo (only
+where Yahoo is reachable; this lazily imports the heavier runner module).
+
+---
+
+## Accurate re-OCR → `stock_analysis_calls` (EasyOCR, CPU fallback)
 
 The original Tesseract whole-frame parser was inaccurate (wrong company on most
 cards, targets polluted with duration/quote numbers, garbled Hindi analyst
 names). `ocr_stock_analysis_fill.py` re-reads the card frames **already in
 Supabase Storage** with EasyOCR (Devanagari + English) + a layout-aware parser,
 market-enriches via the same `enrich_card`, and fills the dedicated
-`stock_analysis_calls` table. No video download / ffmpeg needed — it's pure
-image→text, so it's fast and fully parallel across CPUs.
+`stock_analysis_calls` table. No video download / ffmpeg needed. It now runs
+**strictly sequentially** (one image at a time) — the old threaded pool
+deadlocked torch/EasyOCR — so it is slow but reliable. Prefer the GPU VLM path
+above when you have a GPU.
 
 Prereq: create the table once in the Supabase SQL editor using
 `stock_analysis_calls_schema.sql` (repo root).
@@ -17,8 +56,7 @@ Prereq: create the table once in the Supabase SQL editor using
 export url='https://YOUR_PROJECT.supabase.co'
 export secret_key='YOUR_SUPABASE_SERVICE_ROLE_KEY'
 
-bash run_ocr_fill.sh                # background, uses all CPUs
-# bash run_ocr_fill.sh --workers 24 # or pin the worker count
+bash run_ocr_fill.sh                # background, sequential (one image at a time)
 tail -f ./ocr_fill.log
 # stop: kill "$(cat ./ocr_fill.pid)"
 ```
@@ -29,7 +67,7 @@ idempotent (row id keyed on source_url+stock+entry_date), so re-running fills
 gaps and corrects rows in place. Progress prints as JSON lines
 (`{"progress": "...", "rows": N}`), ending with `{"DONE": true, ...}`.
 
-To process just a few jobs as a test: `python ocr_stock_analysis_fill.py --workers 4 --limit 20`.
+To process just a few jobs as a test: `python ocr_stock_analysis_fill.py --limit 20`.
 
 ---
 
