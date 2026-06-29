@@ -101,20 +101,22 @@ def _storage_get(path: str) -> bytes:
 _DEVA = str.maketrans("०१२३४५६७८९", "0123456789")
 _NUM = re.compile(r"\d[\d,]*(?:\.\d+)?")
 _PANEL_X = 0.56
-# One EasyOCR Reader per thread (each owns its own torch model — avoids any
-# shared-state thread-safety question; the weights are read from the cache the
-# main thread warmed, so no per-thread download).
-_tls = threading.local()
+# ONE shared EasyOCR Reader, built once in the main thread and reused by every
+# worker thread. Building a torch model concurrently in many threads deadlocks;
+# inference (readtext) on a shared eval model is fine across threads.
+_READER = None
+_READER_LOCK = threading.Lock()
 
 
 def _get_reader():
-    r = getattr(_tls, "reader", None)
-    if r is None:
-        import easyocr
+    global _READER
+    if _READER is None:
+        with _READER_LOCK:
+            if _READER is None:
+                import easyocr
 
-        r = easyocr.Reader(["hi", "en"], gpu=False, verbose=False)
-        _tls.reader = r
-    return r
+                _READER = easyocr.Reader(["hi", "en"], gpu=False, verbose=False)
+    return _READER
 
 
 class _Box:
