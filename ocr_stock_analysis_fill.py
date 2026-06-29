@@ -106,6 +106,10 @@ _PANEL_X = 0.56
 # inference (readtext) on a shared eval model is fine across threads.
 _READER = None
 _READER_LOCK = threading.Lock()
+# EasyOCR/torch deadlocks under many concurrent readtext calls (fine at 4
+# threads, hangs at 16). Serialize inference; frame downloads still overlap
+# across the worker threads, so the network I/O is what parallelizes.
+_OCR_LOCK = threading.Lock()
 
 
 def _get_reader():
@@ -120,9 +124,9 @@ def _get_reader():
 
 
 def _readtext(img):
-    # Shared reader, concurrent inference (verified working). Model is built once
-    # in the main thread; building per-thread deadlocks, so never do that.
-    return _get_reader().readtext(img)
+    reader = _get_reader()
+    with _OCR_LOCK:
+        return reader.readtext(img)
 
 
 class _Box:
