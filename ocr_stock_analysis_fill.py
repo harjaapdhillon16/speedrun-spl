@@ -119,6 +119,12 @@ def _get_reader():
     return _READER
 
 
+def _readtext(img):
+    # Shared reader, concurrent inference (verified working). Model is built once
+    # in the main thread; building per-thread deadlocks, so never do that.
+    return _get_reader().readtext(img)
+
+
 class _Box:
     __slots__ = ("text", "conf", "cx", "cy", "x0", "y0", "x1", "y1")
 
@@ -155,7 +161,7 @@ def _split_nums(s: str) -> list:
 
 def extract(img) -> dict:
     h, w = img.shape[:2]
-    boxes = [_Box(t, c, pts, w, h) for pts, t, c in _get_reader().readtext(img)]
+    boxes = [_Box(t, c, pts, w, h) for pts, t, c in _readtext(img)]
     panel = [b for b in boxes if b.x0 < _PANEL_X]
 
     def deva_ratio(s: str) -> float:
@@ -497,8 +503,11 @@ def main() -> None:
     pending: list[dict] = []
     with ThreadPoolExecutor(max_workers=args.workers) as pool:
         futs = {pool.submit(_process_job, j): j for j in jobs}
+        log_event({"pool_submitted": len(futs)})
         for fut in as_completed(futs):
             done += 1
+            if done <= 3 or done % 10 == 0:
+                log_event({"job_done": done, "rows": total, "pending": len(pending)})
             try:
                 recs = fut.result()
             except Exception as exc:  # noqa: BLE001
